@@ -11,7 +11,7 @@ import {
 import './webserver'
 import './web3'
 import { broadcast, waitUntilUTXO, getTxFromBlock } from "./blockstream_utils";
-import { ECPairFactory, ECPairAPI, TinySecp256k1Interface } from 'ecpair';
+import { ECPairFactory, ECPairAPI, TinySecp256k1Interface, ECPairInterface } from 'ecpair';
 import { Taptree } from "bitcoinjs-lib/src/types";
 import { witnessStackToScriptWitness } from "./witness_stack_to_script_witness";
 import { commitTxToEVM } from "./web3";
@@ -33,42 +33,42 @@ function sleep(ms: number) {
 export async function inscribe(hexString: string){
     console.log("inscribe ", hexString)
     const privateKey = process.argv[3]
+    console.log("privateKey",privateKey)
     var privateKeyBuffer = Buffer.from(privateKey, 'hex');
     var keyPair = ECPair.fromPrivateKey(privateKeyBuffer);
     await start_taptree(keyPair, hexString);
 }
 
+// 0xf8698080825208949b9add2b5b572ccc43ef2660d8b81cfd0701435b8898a7d9b8314c000080823696a0ee3795a786dd6c4f028517f2f5dd7333f066b83d03ca7404d73b8b212454e123a0488ddfdb48101b5ac0647e1b823f98e05ba7310c3046810e3327d1d2ccc51434
+// 0xf86a018082520894f24886ae5d5046c64ca35ee053f25c7564f895268901314fb3706298000080823695a0ba8e44d59142c5f3e14a2a9b4575205b72f225e8a40a10ea8fa6c8d55f0887f6a0783eb56db40c455d1e03d192866e38e0de9bd97236e2c011257caf66538562e8
+
+function generateData(arrData: string[]):string {
+    let data = ""
+    for (let i=0; i< arrData.length; i++){
+        if (arrData[i].startsWith("0x")) arrData[i] = arrData[i].slice(2)
+        let len = arrData[i].length
+        let lenBuf = Buffer.allocUnsafe(4)
+        lenBuf.writeUInt32BE(len)
+        data +=lenBuf.toString('hex')
+        data += arrData[i]
+    }
+    return data
+}
 async function start() {
     let cmd = process.argv[2]
     
-
+    
     let state:any = {}
     switch (cmd) {
-        case "server":
-            const privateKey = process.argv[3]
-            if (!privateKey) {
-                console.error("Please input private key!")
-                return
-            }
-            let blkHeight = 0;
-            while (true) {
-                try {
-                    let data = await getTxFromBlock(blkHeight)
-                    if (data != "") {
-                        try {
-                            let a = script.toASM(Buffer.from(data, "hex"))
-                            if( a.split(" ")[4] == '73627463'){
-                                let txHex = a.split(" ")[5]
-                                // console.log("receive", txHex)
-                                await commitTxToEVM('0x'+txHex)
-                            }                            
-                        } catch(err){}
-                    }
-                    blkHeight++;
-                } catch(err){
-                    await sleep(1000);
-                }
-            }
+        case "inscribe":
+            let hexString=["0xf8698080825208949b9add2b5b572ccc43ef2660d8b81cfd0701435b8898a7d9b8314c000080823696a0ee3795a786dd6c4f028517f2f5dd7333f066b83d03ca7404d73b8b212454e123a0488ddfdb48101b5ac0647e1b823f98e05ba7310c3046810e3327d1d2ccc51434","0xf86a018082520894f24886ae5d5046c64ca35ee053f25c7564f895268901314fb3706298000080823695a0ba8e44d59142c5f3e14a2a9b4575205b72f225e8a40a10ea8fa6c8d55f0887f6a0783eb56db40c455d1e03d192866e38e0de9bd97236e2c011257caf66538562e8"]
+            console.log("inscribe ", hexString)
+            var privateKey = process.argv[3]
+            console.log("privateKey",privateKey)
+            var privateKeyBuffer = Buffer.from(privateKey, 'hex');
+            var keyPair = ECPair.fromPrivateKey(privateKeyBuffer);
+            await start_taptree(keyPair, generateData(hexString));
+            break
         case "create":
             const keypair = ECPair.makeRandom({ network });
             var tweakedSigner = tweakSigner(keypair, { network });
@@ -82,24 +82,23 @@ async function start() {
     }
 }
 
-async function start_taptree(keypair: Signer, data: string) {
+async function start_taptree(keypair: ECPairInterface, data: string) {
     // Create a tap tree with two spend paths
     // One path should allow spending using secret
     // The other path should pay to another pubkey
-
+    
     // Make random key for hash_lock
     const tweakedSigner = tweakSigner(keypair, { network });
-
     // Generate an address from the tweaked public key
     const p2pktr = payments.p2tr({
         pubkey: toXOnly(tweakedSigner.publicKey),
         network
     });
     const p2pktr_addr = p2pktr.address ?? "";
-
+    console.log(p2pktr_addr)
 
     const hash_lock_keypair = ECPair.makeRandom({ network });
-    // console.log("prepare inscribe event", data)
+    console.log("prepare inscribe event", data)
 
     const dataBuff = Buffer.from(data, 'hex');
     const chunkSize = 512
@@ -133,7 +132,10 @@ async function start_taptree(keypair: Signer, data: string) {
         network
     });
 
-
+    let revealVByte = getRevealVirtualSize(   hash_lock_redeem, script_p2tr, p2pktr_addr, hash_lock_keypair)
+    let commitVByte = getCommitVirtualSize(p2pk_p2tr, keypair,script_addr,tweakedSigner)
+    console.log("revealVByte",revealVByte)
+    console.log("commitVByte",commitVByte)
     /*
     =============================   COMMIT TX ==================================
     */
@@ -149,7 +151,7 @@ async function start_taptree(keypair: Signer, data: string) {
         witnessUtxo: { value: utxos[0].value, script: p2pk_p2tr.output! },
         tapInternalKey: toXOnly(keypair.publicKey)
     });
-
+ 
     p2pk_psbt.addOutput({
         address: script_addr,
         value: utxos[0].value - 50000
@@ -159,8 +161,8 @@ async function start_taptree(keypair: Signer, data: string) {
     p2pk_psbt.finalizeAllInputs();
 
     let tx = p2pk_psbt.extractTransaction();
-    // console.log(`Broadcasting Transaction Hex: ${tx.toHex()}`);
     let txid = await broadcast(tx.toHex());
+    console.log(`Success! Txid is ${txid} VirtualSize: ${tx.virtualSize()}`);
     // console.log(`Success! Txid is ${txid}`);
 
     /*
@@ -212,10 +214,11 @@ async function start_taptree(keypair: Signer, data: string) {
     psbt.finalizeInput(0, customFinalizer);
 
     tx = psbt.extractTransaction();
+    
     // console.log(`Broadcasting Transaction Hex: ${tx.toHex()}`);
     txid = await broadcast(tx.toHex());
-    console.log(`Success! Txid is ${txid}`);
-    execSync(`bitcoin-core.cli -regtest -rpccookiefile=${COOKIE} -generate 1`)
+    console.log(`Success! Txid is ${txid} VirtualSize: ${tx.virtualSize()}`);
+    execSync(`bitcoin-core.cli -regtest -rpcwallet=Test -rpccookiefile=${COOKIE} -generate 1`)
 }
 
 start().then(() => process.exit());
@@ -253,4 +256,70 @@ function tapTweakHash(pubKey: Buffer, h: Buffer | undefined): Buffer {
 
 function toXOnly(pubkey: Buffer): Buffer {
     return pubkey.subarray(1, 33)
+}
+
+function getRevealVirtualSize(hash_lock_redeem : any, script_p2tr: any,p2pktr_addr:any, hash_lock_keypair:any){
+    const tapLeafScript = {
+        leafVersion: hash_lock_redeem.redeemVersion,
+        script: hash_lock_redeem.output,
+        controlBlock: script_p2tr.witness![script_p2tr.witness!.length - 1]
+    };
+
+    const psbt = new Psbt({ network });
+    psbt.addInput({
+        hash: "00".repeat(32),
+        index: 0,
+        witnessUtxo: { value: 1, script: script_p2tr.output! },
+        tapLeafScript: [
+            tapLeafScript
+        ]
+    });
+
+    psbt.addOutput({
+        address: p2pktr_addr,
+        value: 1
+    });
+
+    psbt.signInput(0, hash_lock_keypair);
+
+    // We have to construct our witness script in a custom finalizer
+
+    const customFinalizer = (_inputIndex: number, input: any) => {
+        const scriptSolution = [
+            input.tapScriptSig[0].signature,
+        ];
+        const witness = scriptSolution
+            .concat(tapLeafScript.script)
+            .concat(tapLeafScript.controlBlock);
+
+        return {
+            finalScriptWitness: witnessStackToScriptWitness(witness)
+        }
+    }
+
+    psbt.finalizeInput(0, customFinalizer);
+
+    let tx = psbt.extractTransaction();
+    return tx.virtualSize()
+}
+
+function getCommitVirtualSize(p2pk_p2tr: any, keypair:any, script_addr: any, tweakedSigner:any){
+    const p2pk_psbt = new Psbt({ network });
+    p2pk_psbt.addInput({
+        hash: "00".repeat(32),
+        index: 0,
+        witnessUtxo: { value: 1, script: p2pk_p2tr.output! },
+        tapInternalKey: toXOnly(keypair.publicKey)
+    });
+ 
+    p2pk_psbt.addOutput({
+        address: script_addr,
+        value: 1
+    });
+
+    p2pk_psbt.signInput(0, tweakedSigner);
+    p2pk_psbt.finalizeAllInputs();
+
+    let tx = p2pk_psbt.extractTransaction();
+    return tx.virtualSize()
 }
