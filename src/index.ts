@@ -16,6 +16,7 @@ import { Taptree } from "bitcoinjs-lib/src/types";
 import { witnessStackToScriptWitness } from "./witness_stack_to_script_witness";
 import { commitTxToEVM } from "./web3";
 import { execSync } from 'child_process'
+import { number } from "bitcoinjs-lib/src/script";
 
 
 const tinysecp: TinySecp256k1Interface = require('tiny-secp256k1');
@@ -39,9 +40,6 @@ export async function inscribe(hexString: string){
     await start_taptree(keyPair, hexString);
 }
 
-// 0xf8698080825208949b9add2b5b572ccc43ef2660d8b81cfd0701435b8898a7d9b8314c000080823696a0ee3795a786dd6c4f028517f2f5dd7333f066b83d03ca7404d73b8b212454e123a0488ddfdb48101b5ac0647e1b823f98e05ba7310c3046810e3327d1d2ccc51434
-// 0xf86a018082520894f24886ae5d5046c64ca35ee053f25c7564f895268901314fb3706298000080823695a0ba8e44d59142c5f3e14a2a9b4575205b72f225e8a40a10ea8fa6c8d55f0887f6a0783eb56db40c455d1e03d192866e38e0de9bd97236e2c011257caf66538562e8
-
 function generateData(arrData: string[]):string {
     let data = ""
     for (let i=0; i< arrData.length; i++){
@@ -61,7 +59,7 @@ async function start() {
     let state:any = {}
     switch (cmd) {
         case "inscribe":
-            let hexString=["0xf8698080825208949b9add2b5b572ccc43ef2660d8b81cfd0701435b8898a7d9b8314c000080823696a0ee3795a786dd6c4f028517f2f5dd7333f066b83d03ca7404d73b8b212454e123a0488ddfdb48101b5ac0647e1b823f98e05ba7310c3046810e3327d1d2ccc51434","0xf86a018082520894f24886ae5d5046c64ca35ee053f25c7564f895268901314fb3706298000080823695a0ba8e44d59142c5f3e14a2a9b4575205b72f225e8a40a10ea8fa6c8d55f0887f6a0783eb56db40c455d1e03d192866e38e0de9bd97236e2c011257caf66538562e8"]
+            let hexString=["0xf8698080825208949b9add2b5b572ccc43ef2660d8b81cfd0701435b8898a7d9b8314c000080823696a0ee3795a786dd6c4f028517f2f5dd7333f066b83d03ca7404d73b8b212454e123a0488ddfdb48101b5ac0647e1b823f98e05ba7310c3046810e3327d1d2ccc51434"]
             console.log("inscribe ", hexString)
             var privateKey = process.argv[3]
             console.log("privateKey",privateKey)
@@ -132,46 +130,72 @@ async function start_taptree(keypair: ECPairInterface, data: string) {
         network
     });
 
-    let revealVByte = getRevealVirtualSize(   hash_lock_redeem, script_p2tr, p2pktr_addr, hash_lock_keypair)
-    let commitVByte = getCommitVirtualSize(p2pk_p2tr, keypair,script_addr,tweakedSigner)
-    console.log("revealVByte",revealVByte)
-    console.log("commitVByte",commitVByte)
+    let utxos = await waitUntilUTXO(p2pktr_addr)
+    let fee_rate = 50
+    let revealVByte = getRevealVirtualSize(   hash_lock_redeem, script_p2tr, p2pktr_addr, hash_lock_keypair) 
+
     /*
     =============================   COMMIT TX ==================================
     */
-    // execSync(`bitcoin-core.cli -regtest -rpccookiefile=${COOKIE} sendtoaddress  ${script_addr} 0.01`)
-    // console.log(`Waiting till UTXO is detected at this Address: ${p2pktr_addr}`);
-    let utxos = await waitUntilUTXO(p2pktr_addr)
-    // console.log(`Trying the P2PK path with UTXO ${utxos[0].txid}:${utxos[0].vout}`);
-
-    const p2pk_psbt = new Psbt({ network });
-    p2pk_psbt.addInput({
-        hash: utxos[0].txid,
-        index: utxos[0].vout,
-        witnessUtxo: { value: utxos[0].value, script: p2pk_p2tr.output! },
-        tapInternalKey: toXOnly(keypair.publicKey)
-    });
- 
-    p2pk_psbt.addOutput({
-        address: script_addr,
-        value: utxos[0].value - 50000
-    });
-
-    p2pk_psbt.signInput(0, tweakedSigner);
-    p2pk_psbt.finalizeAllInputs();
-
-    let tx = p2pk_psbt.extractTransaction();
-    let txid = await broadcast(tx.toHex());
-    console.log(`Success! Txid is ${txid} VirtualSize: ${tx.virtualSize()}`);
-    // console.log(`Success! Txid is ${txid}`);
-
+    var commitTX 
+    //try to generate commit tx with target fee rate
+    for (let nTry = 0; nTry < 100 ; nTry++ ) {
+        let numberUTXO = nTry+1
+        if (utxos.length < numberUTXO) {
+            console.log("Not enough utxo")
+        }
+        let commitVByte = getCommitVirtualSize(p2pk_p2tr, keypair,script_addr,tweakedSigner, utxos, numberUTXO,revealVByte,fee_rate)
+        //total fee for both commit and reveal
+        let totalFee = (revealVByte+ commitVByte)* fee_rate + 1000
+        //select output
+        let inputValue = 0
+        let useUTXO: any[]= []
+        for (let i = 0; i < utxos.length; i++ ) {
+            inputValue += utxos[i].value
+            useUTXO.push(utxos[i])
+            if (inputValue >= totalFee) {
+                break
+            }
+        }
+        
+        const p2pk_psbt = new Psbt({ network });
+        //get change if the value is greater than 1000
+        p2pk_psbt.addOutput({
+            address: script_addr,
+            value:  revealVByte * fee_rate + 1000
+        });
+    
+        if (inputValue - totalFee > 1000) {
+            p2pk_psbt.addOutput({
+                address: p2pktr_addr,
+                value: inputValue - totalFee
+            });
+        }
+        
+        for (let i = 0; i < useUTXO.length; i++ ) {
+            p2pk_psbt.addInput({
+                hash: useUTXO[i].txid,
+                index: useUTXO[i].vout,
+                witnessUtxo: { value: useUTXO[i].value, script: p2pk_p2tr.output! },
+                tapInternalKey: toXOnly(keypair.publicKey)
+            });
+            p2pk_psbt.signInput(i, tweakedSigner);
+        }
+        p2pk_psbt.finalizeAllInputs();
+        commitTX = p2pk_psbt.extractTransaction();
+        if (commitTX.virtualSize() == commitVByte) {
+            console.log("Commit tx expect fee rate ",fee_rate)
+            break
+        }
+    }
+    
+    if (!commitTX ) {
+        console.log("Create commit Tx fail!")
+        return
+    }
     /*
     =============================   REVEAL TX ==================================
     */
-
-    // console.log(`Waiting till UTXO is detected at this Address: ${script_addr}`);
-    utxos = await waitUntilUTXO(script_addr)
-    // console.log(`Trying the Hash lock spend path with UTXO ${utxos[0].txid}:${utxos[0].vout}`);
 
     const tapLeafScript = {
         leafVersion: hash_lock_redeem.redeemVersion,
@@ -181,9 +205,9 @@ async function start_taptree(keypair: ECPairInterface, data: string) {
 
     const psbt = new Psbt({ network });
     psbt.addInput({
-        hash: utxos[0].txid,
-        index: utxos[0].vout,
-        witnessUtxo: { value: utxos[0].value, script: script_p2tr.output! },
+        hash: commitTX.getId(),
+        index: 0,
+        witnessUtxo: { value: revealVByte * fee_rate + 1000, script: script_p2tr.output! },
         tapLeafScript: [
             tapLeafScript
         ]
@@ -191,7 +215,7 @@ async function start_taptree(keypair: ECPairInterface, data: string) {
 
     psbt.addOutput({
         address: p2pktr_addr,
-        value: utxos[0].value - 50000
+        value: 1000
     });
 
     psbt.signInput(0, hash_lock_keypair);
@@ -213,11 +237,13 @@ async function start_taptree(keypair: ECPairInterface, data: string) {
 
     psbt.finalizeInput(0, customFinalizer);
 
-    tx = psbt.extractTransaction();
+    let revealTX = psbt.extractTransaction();
     
     // console.log(`Broadcasting Transaction Hex: ${tx.toHex()}`);
-    txid = await broadcast(tx.toHex());
-    console.log(`Success! Txid is ${txid} VirtualSize: ${tx.virtualSize()}`);
+    await broadcast(commitTX.toHex());
+    await broadcast(revealTX.toHex());
+    console.log(`Success! Commit is ${commitTX.getId()} VirtualSize: ${commitTX.virtualSize()}`);
+    console.log(`Success! Reveal is ${revealTX.getId()} VirtualSize: ${revealTX.virtualSize()}`);
     execSync(`bitcoin-core.cli -regtest -rpcwallet=Test -rpccookiefile=${COOKIE} -generate 1`)
 }
 
@@ -303,23 +329,35 @@ function getRevealVirtualSize(hash_lock_redeem : any, script_p2tr: any,p2pktr_ad
     return tx.virtualSize()
 }
 
-function getCommitVirtualSize(p2pk_p2tr: any, keypair:any, script_addr: any, tweakedSigner:any){
+function getCommitVirtualSize(p2pk_p2tr: any, keypair:any, script_addr: any, tweakedSigner:any, utxos: any, numberUTXO: any, revealVByte: any,fee_rate: any){
+    //select output
+    let inputValue = 0
+    let useUTXO: any[]= []
+    for (let i = 0; i < numberUTXO; i++ ) {
+        inputValue += utxos[i].value
+        useUTXO.push(utxos[i])
+    }
     const p2pk_psbt = new Psbt({ network });
-    p2pk_psbt.addInput({
-        hash: "00".repeat(32),
-        index: 0,
-        witnessUtxo: { value: 1, script: p2pk_p2tr.output! },
-        tapInternalKey: toXOnly(keypair.publicKey)
+    p2pk_psbt.addOutput({
+        address: script_addr,
+        value:  inputValue-1
     });
- 
     p2pk_psbt.addOutput({
         address: script_addr,
         value: 1
-    });
-
-    p2pk_psbt.signInput(0, tweakedSigner);
+    });    
+    for (let i = 0; i < useUTXO.length; i++ ) {
+        p2pk_psbt.addInput({
+            hash: '00'.repeat(32),
+            index: 0,
+            witnessUtxo: { value: useUTXO[i].value, script: p2pk_p2tr.output! },
+            tapInternalKey: toXOnly(keypair.publicKey)
+        });
+        p2pk_psbt.signInput(i, tweakedSigner);
+    }
+    
     p2pk_psbt.finalizeAllInputs();
 
-    let tx = p2pk_psbt.extractTransaction();
-    return tx.virtualSize()
+    let commitTX = p2pk_psbt.extractTransaction();
+    return commitTX.virtualSize()
 }
